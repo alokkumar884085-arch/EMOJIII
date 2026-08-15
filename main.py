@@ -7,7 +7,6 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 import asyncio
 import re
-import requests
 
 # ============ CONFIGURATION ============
 TOKEN = "8904097497:AAGazvlppLfBymhWP18Cjq7Hdi2XSc0DZvo"
@@ -110,7 +109,6 @@ logger = logging.getLogger(__name__)
 async def self_ping(context: ContextTypes.DEFAULT_TYPE):
     """Automatic self-ping every 10 minutes"""
     try:
-        # Send ping to owner
         await context.bot.send_message(
             chat_id=OWNER_ID,
             text=f"🔄 **Bot is Alive!**\n\n"
@@ -645,6 +643,7 @@ async def redeem_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     tier_name = TIERS[tier]['name']
     emoji_count = len(get_available_emojis(int(user_id)))
+    tier_info = TIERS[tier]  # FIXED: Added this line
     
     # Send notification to owner
     await context.bot.send_message(
@@ -845,7 +844,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.warning(f"Update {update} caused error {context.error}")
 
-# ============ MAIN FUNCTION ============
+# ============ MAIN FUNCTION (FIXED) ============
 def main():
     """Start the bot"""
     application = Application.builder().token(TOKEN).build()
@@ -877,11 +876,15 @@ def main():
     # ============ SELF-PING JOB ============
     job_queue = application.job_queue
     if job_queue:
-        # Schedule self-ping every 10 minutes (600 seconds)
         job_queue.run_repeating(self_ping, interval=600, first=10)
         print("🔄 Self-ping scheduled (every 10 minutes)")
     
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Start polling (FIXED: removed allowed_updates)
+    try:
+        application.run_polling()
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        logger.error(f"Bot crashed: {e}")
 
 if __name__ == "__main__":
     main()
