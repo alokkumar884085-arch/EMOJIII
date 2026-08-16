@@ -2,509 +2,704 @@ import logging
 import random
 import string
 import time
+import re
+import json
+import os
+import asyncio
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.request import HTTPXRequest
 
 # ============ CONFIGURATION ============
-TOKEN = "8904097497:AAGazvlppLfBymhWP18Cjq7Hdi2XSc0DZvo"
+TOKEN = "8875994072:AAHOFUpa58yLxU-FFOY6ULFQ9LpTfaZhi88"
 OWNER_ID = 8785590284
+ESCROW_USER = "@escrow2929"
 
-# ============ TELEGRAM PREMIUM EMOJIS ============
-# Ye Official Telegram Premium Emojis hain jo sirf Premium users ko available hain
+# ============ ADMIN LIST ============
+ADMINS = [OWNER_ID]  # Owner + extra admins
 
-TELEGRAM_PREMIUM_EMOJIS = [
-    # Stars & Sparkles (Premium)
-    "✨", "⭐", "🌟", "💫", "🌠", "☄️", 
-    # Hearts & Love (Premium)
-    "💖", "💗", "💝", "💞", "💕", "💘", "💟", "❣️",
-    # Crown & Royal (Premium)
-    "👑", "💎", "🏆", "🥇", "🎖️",
-    # Glowing & Shiny (Premium)
-    "🔥", "⚡", "💥", "🌈", "🎆", "🎇", "✨",
-    # Special Animals (Premium)
-    "🦄", "🐉", "🦋", "🐝", "🐞",
-    # Special Nature (Premium)
-    "🌸", "🌺", "🌹", "🌷", "🌻", "🌼", "💐",
-    # Tech & Gadgets (Premium)
-    "💻", "🖥️", "⌨️", "📱", "📲", "💡", "🔮",
-    # Music & Entertainment (Premium)
-    "🎵", "🎶", "🎼", "🎹", "🎧", "🎤", "🎭", "🎪", "🎨", "🎬",
-    # Sports (Premium)
-    "⚽", "🏀", "🏈", "⚾", "🎾", "🏐", "🎱", "🎳",
-    # Space (Premium)
-    "🪐", "🚀", "🛸", "👽", "🤖", "👾",
-    # Festivals (Premium)
-    "🎊", "🎉", "🎈", "🎀", "🎁", "🎄", "🎃",
-    # Special Badges (Premium)
-    "🏅", "🎗️", "📿", "🧿", "🔯", "🕎", "☯️", "☮️",
-    # Extra Premium (Telegram Exclusive)
-    "💠", "🔮", "💜", "💙", "💚", "💛", "🧡", "❤️", "🖤", "🤍", "🤎"
-]
-
-# ============ TIERS WITH TELEGRAM PREMIUM EMOJIS ============
-TIERS = {
-    "A": {
-        "name": "✨ BASIC PREMIUM",
-        "color": "🟢",
-        "emojis": TELEGRAM_PREMIUM_EMOJIS[:40],  # First 40 premium emojis
-        "access": [],
-        "price": "FREE"
-    },
-    "B": {
-        "name": "💎 SILVER PREMIUM",
-        "color": "🔵",
-        "emojis": TELEGRAM_PREMIUM_EMOJIS[:70],  # First 70 premium emojis
-        "access": ["A"],
-        "price": "₹99/month"
-    },
-    "C": {
-        "name": "🌟 GOLD PREMIUM",
-        "color": "🟡",
-        "emojis": TELEGRAM_PREMIUM_EMOJIS,  # All premium emojis
-        "access": ["A", "B"],
-        "price": "₹199/month"
-    },
-    "D": {
-        "name": "👑 PLATINUM PREMIUM",
-        "color": "🟣",
-        "emojis": TELEGRAM_PREMIUM_EMOJIS * 2,  # Double emojis for more variety
-        "access": ["A", "B", "C"],
-        "price": "₹499/month"
-    }
-}
+# ============ TIME CONFIGURATION ============
+MAINTENANCE_START = 22
+MAINTENANCE_END = 10
+TASK_TIMEOUT_MINUTES = 15
+COOLDOWN_MINUTES = 2
 
 # ============ DATABASE ============
-user_tiers = {}
-user_tier_expiry = {}
-active_codes = {}
-user_cooldowns = {}
+DATA_FILE = "bot_data.json"
 
-# ============ LOGGING ============
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+def load_data():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                for key in ["email_stock", "used_emails", "users", "pending", "withdraw_requests", "cooldowns", "admins"]:
+                    if key not in data:
+                        data[key] = {} if key in ["users", "pending", "cooldowns"] else []
+                return data
+        except Exception as e:
+            logging.error(f"Error loading data: {e}")
+            return default_data()
+    return default_data()
+
+def default_data():
+    return {
+        "users": {},
+        "pending": {},
+        "email_stock": [],
+        "used_emails": [],
+        "withdraw_requests": [],
+        "cooldowns": {},
+        "admins": [OWNER_ID]
+    }
+
+def save_data(data):
+    try:
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4, default=str, ensure_ascii=False)
+        return True
+    except Exception as e:
+        logging.error(f"Error saving data: {e}")
+        return False
+
+data = load_data()
+ADMINS = data.get("admins", [OWNER_ID])
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# ============ SELF-PING ============
+def is_maintenance_mode():
+    now = datetime.now()
+    return now.hour >= MAINTENANCE_START or now.hour < MAINTENANCE_END
+
+def is_admin(user_id):
+    """Check if user is admin or owner"""
+    return user_id in ADMINS or user_id == OWNER_ID
+
+# ============ SELF PING - SIRF OWNER KO (HAR 5 MINUTE) ============
+PING_COUNT = 0
+
 async def self_ping(context: ContextTypes.DEFAULT_TYPE):
+    """Self ping every 5 minutes - sirf owner ko"""
+    global PING_COUNT, data
+    PING_COUNT += 1
+    data = load_data()
+    
     try:
         await context.bot.send_message(
             chat_id=OWNER_ID,
-            text=f"🔄 **Bot is Alive!**\n\n⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n🟢 Status: Active\n💎 Using Telegram Premium Emojis!"
+            text=f"🔄 **BOT IS ALIVE!**\n\n"
+                 f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                 f"📦 Stock: {len(data['email_stock'])}\n"
+                 f"👥 Users: {len(data['users'])}\n"
+                 f"⏳ Pending: {len(data['pending'])}\n"
+                 f"👑 Admins: {len(ADMINS)}\n"
+                 f"📊 Ping #{PING_COUNT}"
         )
+        logger.info(f"Self ping #{PING_COUNT} sent to owner")
     except Exception as e:
-        logger.error(f"Self-ping failed: {e}")
+        logger.error(f"Self ping failed: {e}")
 
-# ============ HELPER FUNCTIONS ============
-def generate_code(tier, duration_hours=24):
-    code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
-    while code in active_codes:
-        code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
-    expiry_time = datetime.now() + timedelta(hours=duration_hours)
-    active_codes[code] = {"tier": tier, "used": False, "expiry": expiry_time}
-    return code, expiry_time
+# ============ CHECK TIMEOUT ============
+def check_pending_timeout():
+    global data
+    now = datetime.now()
+    to_remove = []
+    for user_id, pending in data["pending"].items():
+        if "timestamp" in pending:
+            try:
+                start_time = datetime.fromisoformat(pending["timestamp"])
+                if (now - start_time).total_seconds() > TASK_TIMEOUT_MINUTES * 60:
+                    to_remove.append(user_id)
+            except:
+                continue
+    for user_id in to_remove:
+        pending = data["pending"][user_id]
+        name = pending.get("name", pending.get("username", "User"))
+        email_data = f"{name}|{pending['gmail']}|{pending['password']}|{pending['recovery']}"
+        data["email_stock"].append(email_data)
+        data["cooldowns"][user_id] = (datetime.now() + timedelta(minutes=COOLDOWN_MINUTES)).isoformat()
+        del data["pending"][user_id]
+        save_data(data)
+        logger.info(f"Task timeout for user {user_id}")
 
-def get_available_emojis(user_id):
-    user_id_str = str(user_id)
-    if user_id_str in user_tier_expiry:
-        if datetime.now() > user_tier_expiry[user_id_str]:
-            user_tiers.pop(user_id_str, None)
-            user_tier_expiry.pop(user_id_str, None)
-            return []
-    tier = user_tiers.get(user_id_str)
-    if not tier:
-        return []
-    all_emojis = []
-    for t in ["A", "B", "C", "D"]:
-        all_emojis.extend(TIERS[t]["emojis"])
-        if t == tier:
-            break
-    return all_emojis
+async def check_timeout_job(context: ContextTypes.DEFAULT_TYPE):
+    global data
+    data = load_data()
+    if data["pending"]:
+        check_pending_timeout()
 
-def get_tier_expiry_text(user_id):
-    user_id_str = str(user_id)
-    if user_id_str not in user_tier_expiry:
-        return "❌ No active tier"
-    remaining = user_tier_expiry[user_id_str] - datetime.now()
-    if remaining.total_seconds() <= 0:
-        return "❌ Expired"
-    days = remaining.days
-    hours = remaining.seconds // 3600
-    minutes = (remaining.seconds % 3600) // 60
-    if days > 0:
-        return f"⏰ {days}d {hours}h remaining"
-    elif hours > 0:
-        return f"⏰ {hours}h {minutes}m remaining"
-    else:
-        return f"⏰ {minutes}m remaining"
-
-def add_premium_emojis(text, user_id):
-    emojis = get_available_emojis(user_id)
-    if not emojis:
-        return text
-    words = text.split()
-    if not words:
-        return text
-    new_words = []
-    tier = user_tiers.get(str(user_id))
-    for word in words:
-        if tier == "A" and random.random() < 0.3:
-            new_words.append(f"{word} {random.choice(emojis)}")
-        elif tier == "B" and random.random() < 0.4:
-            new_words.append(f"{word} {random.choice(emojis)}")
-        elif tier == "C" and random.random() < 0.5:
-            count = 2 if random.random() < 0.2 else 1
-            emojis_to_add = random.sample(emojis, min(count, len(emojis)))
-            new_words.append(f"{word} {' '.join(emojis_to_add)}")
-        elif tier == "D" and random.random() < 0.7:
-            count = random.choice([1, 2, 3])
-            emojis_to_add = random.sample(emojis, min(count, len(emojis)))
-            new_words.append(f"{word} {' '.join(emojis_to_add)}")
-        else:
-            new_words.append(word)
-    result = " ".join(new_words)
-    if tier == "C":
-        return f"🌟✨ {result} ✨🌟"
-    elif tier == "D":
-        return f"👑✨💎 {result} 💎✨👑"
-    return result
-
-# ============ COMMAND HANDLERS ============
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await update.message.reply_text(
-        f"🌟✨💎 **WELCOME TO PREMIUM EMOJI BOT** 💎✨🌟\n\n"
-        f"👑 **Hello {user.first_name}!**\n"
-        f"💎 **Telegram Premium Emojis** available!\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📋 **COMMANDS:**\n"
-        f"/start - Welcome ✨\n"
-        f"/status - Check tier 💎\n"
-        f"/tiers - View tiers 🌟\n"
-        f"/buy - Purchase premium 💰\n"
-        f"/redeem [code] - Redeem code 🔑\n"
-        f"/help - Help ℹ️\n"
-        f"/expiry - Check expiry ⏰\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💎 **Premium Emojis Included:**\n"
-        f"✨⭐🌟💫🌠☄️💖💗💝👑💎🏆🔥⚡🌈🦄🐉🌸🌺🌹\n\n"
-        f"👑 **Owner:** `{OWNER_ID}`",
-        parse_mode='Markdown'
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "⚡ **PREMIUM EMOJI BOT - HELP** ⚡\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📋 **COMMANDS:**\n"
-        "/start - Welcome message ✨\n"
-        "/status - Check your tier 💎\n"
-        "/tiers - View all tiers 🌟\n"
-        "/buy - Purchase premium 💰\n"
-        "/redeem [code] - Redeem code 🔑\n"
-        "/help - This message ℹ️\n"
-        "/expiry - Check expiry ⏰\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "💎 **Telegram Premium Emojis:**\n"
-        "✨⭐🌟💫🌠☄️💖💗💝👑💎🏆\n"
-        "🔥⚡🌈🦄🐉🌸🌺🌹💐🎆🎇\n\n"
-        "👑 **Owner:** `{}`\n\n"
-        "💎 **Enjoy Premium Emojis!** 💎".format(OWNER_ID),
-        parse_mode='Markdown'
-    )
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    tier = user_tiers.get(user_id)
-    if tier:
-        tier_info = TIERS[tier]
-        emoji_count = len(get_available_emojis(user_id))
-        await update.message.reply_text(
-            f"✨💎 **YOUR PREMIUM STATUS** 💎✨\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"👤 **User:** {update.effective_user.first_name}\n"
-            f"{tier_info['color']} **Tier:** {tier_info['name']}\n"
-            f"📊 **Emojis:** {emoji_count} Premium Emojis\n"
-            f"⏰ **Expiry:** {get_tier_expiry_text(user_id)}\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"💎 **Telegram Premium Emojis Active!** ✨",
-            parse_mode='Markdown'
-        )
-    else:
-        await update.message.reply_text(
-            "⚠️ **No Premium Tier Active**\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "🎯 **Get Premium Access:**\n"
-            "1️⃣ /buy - Purchase premium\n"
-            "2️⃣ Contact owner for code\n"
-            "3️⃣ /redeem [code] to redeem\n\n"
-            f"👑 **Owner:** `{OWNER_ID}`\n\n"
-            "💎 **Get Telegram Premium Emojis Today!** ✨",
-            parse_mode='Markdown'
-        )
-
-async def tiers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🌟💎 **PREMIUM TIERS** 💎🌟\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🟢 **TIER A - BASIC** (FREE)\n"
-        "├─ 40+ Telegram Premium Emojis\n"
-        "└─ FREE for everyone! ✨\n\n"
-        "🔵 **TIER B - SILVER** (₹99/mo)\n"
-        "├─ 70+ Telegram Premium Emojis\n"
-        "├─ Includes Tier A\n"
-        "└─ More variety 💎\n\n"
-        "🟡 **TIER C - GOLD** (₹199/mo)\n"
-        "├─ 100+ Telegram Premium Emojis\n"
-        "├─ Includes A & B\n"
-        "├─ Double emoji chance\n"
-        "└─ Special badge 🌟\n\n"
-        "🟣 **TIER D - PLATINUM** (₹499/mo)\n"
-        "├─ ALL Telegram Premium Emojis\n"
-        "├─ Includes ALL tiers\n"
-        "├─ 3x More Emojis! ✨\n"
-        "├─ Emojis on EVERY word\n"
-        "└─ Platinum badge 👑\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "💎 **All emojis are Telegram Premium!** \n"
-        f"👑 **Owner:** `{OWNER_ID}`",
-        parse_mode='Markdown'
-    )
-
-async def gen_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("❌ **Unauthorized!** Only owner can generate codes.", parse_mode='Markdown')
+# ============ NEW ADMIN COMMAND ============
+async def newadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add new admin (Owner only)"""
+    global data, ADMINS
+    
+    user_id = update.effective_user.id
+    
+    if user_id != OWNER_ID:
+        await update.message.reply_text("❌ **Only Owner can add admins!**", parse_mode='Markdown')
         return
+    
+    if len(context.args) < 1:
+        await update.message.reply_text(
+            "👑 **ADD NEW ADMIN**\n\n"
+            "Usage: `/newadmin [user_id]`\n\n"
+            "Example: `/newadmin 123456789`\n\n"
+            f"Current Admins: {ADMINS}",
+            parse_mode='Markdown'
+        )
+        return
+    
+    try:
+        new_admin_id = int(context.args[0])
+    except:
+        await update.message.reply_text("❌ Invalid User ID! Must be a number.", parse_mode='Markdown')
+        return
+    
+    if new_admin_id in ADMINS:
+        await update.message.reply_text(f"⚠️ User `{new_admin_id}` is already an admin.", parse_mode='Markdown')
+        return
+    
+    ADMINS.append(new_admin_id)
+    data["admins"] = ADMINS
+    save_data(data)
+    
+    await update.message.reply_text(
+        f"✅ **NEW ADMIN ADDED!**\n\n"
+        f"👑 User ID: `{new_admin_id}`\n"
+        f"📋 Total Admins: {len(ADMINS)}\n\n"
+        f"New admin can now use `/upload`, `/stock`, `/approve` commands.",
+        parse_mode='Markdown'
+    )
+    
+    # Notify new admin
+    try:
+        await context.bot.send_message(
+            chat_id=new_admin_id,
+            text=f"👑 **You are now an Admin!**\n\n"
+                 f"You can use admin commands:\n"
+                 f"/upload - Add email stock\n"
+                 f"/stock - Check stock\n"
+                 f"/approve - Approve withdrawals",
+            parse_mode='Markdown'
+        )
+    except:
+        pass
+    
+    logger.info(f"New admin added: {new_admin_id}")
+
+# ============ ADMIN COMMANDS (Now accessible to all admins) ============
+
+async def upload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Upload email stock (Admins + Owner)"""
+    global data
+    
+    user_id = update.effective_user.id
+    
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ **Unauthorized!** Only admins can upload.", parse_mode='Markdown')
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "📤 **UPLOAD FORMAT**\n\n"
+            "/upload Name|Email|Pass|Recovery\n\n"
+            "Multiple:\n"
+            "/upload Name1|Email1|Pass1|Rec1,Name2|Email2|Pass2|Rec2\n\n"
+            f"📦 Current Stock: {len(data['email_stock'])}",
+            parse_mode='Markdown'
+        )
+        return
+    
+    emails = context.args[0].split(",")
+    count = 0
+    for email in emails:
+        email = email.strip()
+        if "|" in email:
+            parts = email.split("|")
+            if len(parts) >= 3:
+                data["email_stock"].append(email)
+                count += 1
+    
+    save_data(data)
+    data = load_data()
+    
+    await update.message.reply_text(
+        f"✅ **EMAIL STOCK UPDATED!**\n\n"
+        f"📤 Added: {count}\n"
+        f"📦 Total Stock: {len(data['email_stock'])}",
+        parse_mode='Markdown'
+    )
+
+async def stock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check stock (Admins + Owner)"""
+    global data
+    
+    user_id = update.effective_user.id
+    
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ **Unauthorized!**", parse_mode='Markdown')
+        return
+    
+    data = load_data()
+    
+    await update.message.reply_text(
+        f"📊 **STOCK STATUS**\n\n"
+        f"📦 Available: {len(data['email_stock'])}\n"
+        f"✅ Used: {len(data['used_emails'])}\n"
+        f"⏳ Pending: {len(data['pending'])}\n"
+        f"👥 Total Users: {len(data['users'])}\n"
+        f"👑 Admins: {len(ADMINS)}\n"
+        f"📌 Status: {'✅ Active' if data['email_stock'] else '⚠️ Empty'}",
+        parse_mode='Markdown'
+    )
+
+async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Approve withdrawal (Admins + Owner)"""
+    global data
+    
+    user_id = update.effective_user.id
+    
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ **Unauthorized!**", parse_mode='Markdown')
+        return
+    
     if len(context.args) < 2:
         await update.message.reply_text(
-            "❌ **Usage:** /gen [A/B/C/D] [time]\n\n"
-            "**Examples:**\n"
-            "/gen D 1mo\n"
-            "/gen B 7d\n"
-            "/gen C 1y",
+            "Usage: `/approve [user_id] [amount]`\n\n"
+            "Example: `/approve 123456789 15`",
             parse_mode='Markdown'
         )
         return
-    tier = context.args[0].upper()
-    time_str = context.args[1].lower()
-    if tier not in TIERS:
-        await update.message.reply_text("❌ Invalid tier! Use: A, B, C, D", parse_mode='Markdown')
-        return
-    duration_hours = 0
-    if time_str.endswith('h'):
-        duration_hours = int(time_str[:-1])
-    elif time_str.endswith('d'):
-        duration_hours = int(time_str[:-1]) * 24
-    elif time_str.endswith('mo'):
-        duration_hours = int(time_str[:-2]) * 30 * 24
-    elif time_str.endswith('y'):
-        duration_hours = int(time_str[:-1]) * 365 * 24
-    else:
-        await update.message.reply_text("❌ Invalid time! Use: 1h, 2d, 1mo, 1y", parse_mode='Markdown')
-        return
-    code, expiry = generate_code(tier, duration_hours)
-    tier_name = TIERS[tier]['name']
-    await update.message.reply_text(
-        f"✅ **CODE GENERATED!** ✅\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🎯 **Tier:** {tier_name}\n"
-        f"🔑 **Code:** `{code}`\n"
-        f"⏰ **Expires:** {expiry.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        f"📤 **Share with user:**\n"
-        f"/redeem {code}\n\n"
-        f"⚠️ **Single use only!**",
-        parse_mode='Markdown'
-    )
-
-async def redeem_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    if not context.args:
-        await update.message.reply_text("❌ **Usage:** /redeem [code]\nExample: /redeem ABC12345", parse_mode='Markdown')
-        return
-    code = context.args[0].upper()
-    if code not in active_codes:
-        await update.message.reply_text("❌ **Invalid Code!** This code doesn't exist.", parse_mode='Markdown')
-        return
-    code_data = active_codes[code]
-    if datetime.now() > code_data["expiry"]:
-        await update.message.reply_text("❌ **Code Expired!** This code has expired.", parse_mode='Markdown')
-        return
-    if code_data["used"]:
-        await update.message.reply_text("❌ **Already Used!** This code has been redeemed.", parse_mode='Markdown')
-        return
-    tier = code_data["tier"]
-    user_tiers[user_id] = tier
-    user_tier_expiry[user_id] = code_data["expiry"]
-    code_data["used"] = True
-    tier_name = TIERS[tier]['name']
-    emoji_count = len(get_available_emojis(int(user_id)))
     
-    # Notify owner
+    target_id = context.args[0]
+    amount = int(context.args[1])
+    
+    data = load_data()
+    
+    if target_id not in data["users"]:
+        await update.message.reply_text(f"❌ User `{target_id}` not found.", parse_mode='Markdown')
+        return
+    
+    data["users"][target_id]["balance"] -= amount
+    for req in data.get("withdraw_requests", []):
+        if req["user_id"] == target_id and req["amount"] == amount and req["status"] == "pending":
+            req["status"] = "approved"
+            req["approved_at"] = datetime.now().isoformat()
+            break
+    save_data(data)
+    
     await context.bot.send_message(
-        OWNER_ID,
-        f"✅ **Code Redeemed!**\n\n👤 {update.effective_user.first_name}\n🎯 {tier_name}\n🔑 {code}"
+        int(target_id), 
+        f"💰 **WITHDRAWAL APPROVED!**\n\n✅ ₹{amount} has been sent to your UPI.", 
+        parse_mode='Markdown'
     )
+    await update.message.reply_text(f"✅ Approved ₹{amount} for `{target_id}`", parse_mode='Markdown')
+
+# ============ USER COMMANDS ============
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global data
+    data = load_data()
+    user = update.effective_user
+    user_id = str(user.id)
+    
+    if is_maintenance_mode():
+        await update.message.reply_text("🛠️ Maintenance Mode (10 PM - 10 AM IST).", parse_mode='Markdown')
+        return
+    
+    if user_id not in data["users"]:
+        data["users"][user_id] = {"gmail": "", "password": "", "recovery": "", "timestamp": "", "upi": "", "balance": 0, "username": user.first_name, "completed": False}
+        save_data(data)
     
     await update.message.reply_text(
-        f"🎉 **TIER UPGRADED!** 🎉\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💎 **Tier:** {tier_name}\n"
-        f"📊 **Emojis:** {emoji_count} Premium Emojis\n"
-        f"⏰ **Valid until:** {code_data['expiry'].strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        f"✨ **Telegram Premium Emojis Activated!** ✨",
+        f"📧 **GMAIL VERIFICATION BOT**\n\n👋 Hello {user.first_name}!\n💰 **Earn ₹15 per Gmail!**\n\n"
+        "📋 **Commands:**\n/new - Start\n/status - Check\n/balance - Check balance\n/withdraw - Withdraw\n/setupi [UPI] - Set UPI\n/cancel - Cancel\n/help - Help\n\n"
+        f"👑 Admin: {ESCROW_USER}",
         parse_mode='Markdown'
     )
 
-async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("🟢 Tier A - FREE (40+ Emojis)", callback_data="buy_A")],
-        [InlineKeyboardButton("🔵 Tier B - ₹99/mo (70+ Emojis)", callback_data="buy_B")],
-        [InlineKeyboardButton("🟡 Tier C - ₹199/mo (100+ Emojis)", callback_data="buy_C")],
-        [InlineKeyboardButton("🟣 Tier D - ₹499/mo (All Emojis)", callback_data="buy_D")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
-    ]
-    await update.message.reply_text(
-        "💎 **SELECT YOUR PREMIUM TIER** 💎\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🟢 **Tier A** - 40+ Premium Emojis (FREE)\n"
-        "🔵 **Tier B** - 70+ Premium Emojis (₹99/mo)\n"
-        "🟡 **Tier C** - 100+ Premium Emojis (₹199/mo)\n"
-        "🟣 **Tier D** - ALL Premium Emojis (₹499/mo)\n\n"
-        "✨ **All emojis are Telegram Premium!**",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
-    )
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    if data == "cancel":
-        await query.edit_message_text("❌ **Cancelled.**", parse_mode='Markdown')
-        return
-    if data.startswith("buy_"):
-        tier = data.split("_")[1]
-        if tier == "A":
-            await query.edit_message_text(
-                "✅ **Tier A is FREE!**\n\n"
-                "✨ You now have access to 40+ Telegram Premium Emojis!\n"
-                "💎 Just send any message to see them in action!",
-                parse_mode='Markdown'
-            )
-            # Auto-assign Tier A
-            user_id = str(query.from_user.id)
-            user_tiers[user_id] = "A"
-            user_tier_expiry[user_id] = datetime.now() + timedelta(days=365)
-        else:
-            keyboard = [
-                [InlineKeyboardButton("✅ Confirm Purchase", callback_data=f"confirm_{tier}")],
-                [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
-            ]
-            await query.edit_message_text(
-                f"💳 **PURCHASE CONFIRMATION** 💳\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"📋 **Tier:** {TIERS[tier]['name']}\n"
-                f"💰 **Price:** {TIERS[tier]['price']}\n"
-                f"💎 **Emojis:** {len(TIERS[tier]['emojis'])} Premium Emojis\n\n"
-                f"⚠️ **Payment is manual.**\n"
-                f"👑 **Contact owner:** @OwnerUsername\n\n"
-                f"Click confirm to proceed:",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-    elif data.startswith("confirm_"):
-        tier = data.split("_")[1]
-        user_id = query.from_user.id
-        user_name = query.from_user.first_name
-        
-        # Notify owner
-        await context.bot.send_message(
-            OWNER_ID,
-            f"💰 **NEW PURCHASE REQUEST!** 💰\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"👤 **User:** {user_name} (ID: {user_id})\n"
-            f"🎯 **Tier:** {TIERS[tier]['name']}\n"
-            f"💰 **Price:** {TIERS[tier]['price']}\n"
-            f"⏰ **Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            f"📧 **Contact user to complete payment.**"
-        )
-        
-        await query.edit_message_text(
-            f"✅ **PURCHASE REQUEST SENT!** ✅\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📋 **Tier:** {TIERS[tier]['name']}\n"
-            f"💎 **Status:** Pending Payment\n\n"
-            f"📧 **Next Steps:**\n"
-            f"1️⃣ Contact owner for payment\n"
-            f"2️⃣ Complete payment\n"
-            f"3️⃣ Receive your code\n"
-            f"4️⃣ Use /redeem [code]\n\n"
-            f"👑 **Owner:** @OwnerUsername\n\n"
-            f"💎 **Thank you for your interest!** ✨",
-            parse_mode='Markdown'
-        )
-
-async def expiry_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global data
+    data = load_data()
+    
     user_id = str(update.effective_user.id)
-    if user_id not in user_tiers:
-        await update.message.reply_text(
-            "⚠️ **No active premium tier.**\n\n"
-            "Use /buy to purchase or /redeem [code] to redeem.",
-            parse_mode='Markdown'
-        )
+    username = update.effective_user.username or update.effective_user.first_name
+    
+    if is_maintenance_mode():
+        await update.message.reply_text("🛠️ Maintenance Mode.", parse_mode='Markdown')
         return
-    tier = user_tiers[user_id]
-    tier_name = TIERS[tier]['name']
-    expiry_text = get_tier_expiry_text(user_id)
+    
+    if user_id in data.get("cooldowns", {}):
+        cooldown_end = datetime.fromisoformat(data["cooldowns"][user_id])
+        if datetime.now() < cooldown_end:
+            remaining = (cooldown_end - datetime.now()).seconds // 60
+            await update.message.reply_text(f"⏳ Cooldown: {remaining + 1} minutes", parse_mode='Markdown')
+            return
+        else:
+            del data["cooldowns"][user_id]
+            save_data(data)
+    
+    if user_id in data["users"] and data["users"][user_id].get("completed", False):
+        await update.message.reply_text("❌ Already completed!", parse_mode='Markdown')
+        return
+    
+    if not data["email_stock"]:
+        await update.message.reply_text("❌ No stock! Admin notified.", parse_mode='Markdown')
+        for admin in ADMINS:
+            try:
+                await context.bot.send_message(admin, "⚠️ STOCK EMPTY! Use /upload")
+            except:
+                pass
+        return
+    
+    if user_id in data["pending"]:
+        await update.message.reply_text("⏳ Pending! Use /cancel", parse_mode='Markdown')
+        return
+    
+    email_data = data["email_stock"].pop(0)
+    parts = email_data.split("|")
+    
+    if len(parts) == 4:
+        name, gmail, password, recovery = parts
+    else:
+        gmail, password, recovery = parts[0], parts[1], parts[2]
+        name = username
+    
+    data["pending"][user_id] = {
+        "gmail": gmail, "password": password, "recovery": recovery,
+        "name": name, "timestamp": datetime.now().isoformat(), "username": username
+    }
+    save_data(data)
+    
+    # Send to all admins
+    for admin in ADMINS:
+        try:
+            await context.bot.send_message(
+                admin,
+                f"📧 **GMAIL ASSIGNED!**\n"
+                f"👤 @{username} (ID: `{user_id}`)\n"
+                f"📧 `{gmail}`\n"
+                f"📦 Stock Left: {len(data['email_stock'])}"
+            )
+        except:
+            pass
+    
+    # Send to user
     await update.message.reply_text(
-        f"⏰ **PREMIUM EXPIRY** ⏰\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👤 **User:** {update.effective_user.first_name}\n"
-        f"💎 **Tier:** {tier_name}\n"
-        f"⏳ {expiry_text}\n\n"
-        f"💎 Want to extend? Contact owner!",
+        f"📧 **GMAIL ASSIGNED!**\n\n"
+        f"👤 Name: `{name}`\n"
+        f"📧 Email: `{gmail}`\n"
+        f"🔑 Password: `{password}`\n"
+        f"📧 Recovery: `{recovery}`\n\n"
+        "📌 Login → /skip2fa or upload QR → OTP → Screenshot\n\n"
+        f"⏰ {TASK_TIMEOUT_MINUTES} minutes timeout!\n"
+        "/skip2fa - Skip 2FA\n/cancel - Cancel",
         parse_mode='Markdown'
     )
+
+async def skip2fa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global data
+    data = load_data()
+    user_id = str(update.effective_user.id)
+    if user_id not in data["pending"]:
+        await update.message.reply_text("❌ No pending!", parse_mode='Markdown')
+        return
+    data["pending"][user_id]["skip_2fa"] = True
+    data["pending"][user_id]["step"] = "waiting_screenshot"
+    save_data(data)
+    await update.message.reply_text("✅ 2FA Skipped!\n📸 Send screenshot.", parse_mode='Markdown')
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global data
+    data = load_data()
+    user_id = str(update.effective_user.id)
+    if user_id not in data["pending"]:
+        return
+    
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    data["pending"][user_id]["qr_file_id"] = photo.file_id
+    otp = random.randint(100000, 999999)
+    data["pending"][user_id]["otp"] = otp
+    data["pending"][user_id]["step"] = "waiting_otp"
+    save_data(data)
+    await update.message.reply_text(f"✅ QR Received!\n📱 OTP: `{otp}`\n\nEnter OTP:", parse_mode='Markdown')
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    global data
+    data = load_data()
+    user_id = str(update.effective_user.id)
     text = update.message.text
-    if not text:
+    if not text or user_id not in data["pending"]:
         return
-    if user_id in user_cooldowns and time.time() - user_cooldowns[user_id] < 1:
+    if data["pending"][user_id].get("step") == "waiting_otp":
+        await handle_otp_input(update, context)
+
+async def handle_otp_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global data
+    data = load_data()
+    user_id = str(update.effective_user.id)
+    text = update.message.text.strip()
+    
+    if not text.isdigit() or len(text) != 6:
+        await update.message.reply_text("❌ 6-digit OTP!", parse_mode='Markdown')
         return
-    user_cooldowns[user_id] = time.time()
-    if str(user_id) not in user_tiers:
-        user_tiers[str(user_id)] = "A"
-        user_tier_expiry[str(user_id)] = datetime.now() + timedelta(days=365)
-    premium_text = add_premium_emojis(text, user_id)
-    if premium_text != text:
-        await update.message.reply_text(premium_text)
+    
+    stored_otp = data["pending"][user_id].get("otp")
+    if int(text) != stored_otp:
+        await update.message.reply_text("❌ Wrong OTP! Try again.", parse_mode='Markdown')
+        return
+    
+    data["pending"][user_id]["otp_verified"] = True
+    data["pending"][user_id]["step"] = "waiting_screenshot"
+    save_data(data)
+    await update.message.reply_text("✅ OTP Verified!\n📸 Send screenshot.", parse_mode='Markdown')
+
+async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global data
+    data = load_data()
+    user_id = str(update.effective_user.id)
+    username = update.effective_user.username or update.effective_user.first_name
+    
+    if user_id not in data["pending"]:
+        return
+    if not update.message.photo and not update.message.document:
+        await update.message.reply_text("❌ Send screenshot!", parse_mode='Markdown')
+        return
+    
+    file_id = update.message.photo[-1].file_id if update.message.photo else update.message.document.file_id
+    pending = data["pending"][user_id]
+    gmail, password, recovery = pending["gmail"], pending["password"], pending["recovery"]
+    name = pending.get("name", username)
+    
+    data["users"][user_id] = {
+        "gmail": gmail, "password": password, "recovery": recovery,
+        "name": name, "timestamp": datetime.now().isoformat(),
+        "upi": data["users"].get(user_id, {}).get("upi", ""),
+        "balance": 15, "username": username, "completed": True,
+        "screenshot": file_id, "skip_2fa": pending.get("skip_2fa", False)
+    }
+    data["used_emails"].append(gmail)
+    if user_id in data["cooldowns"]:
+        del data["cooldowns"][user_id]
+    del data["pending"][user_id]
+    save_data(data)
+    
+    # Send to all admins
+    for admin in ADMINS:
+        try:
+            await context.bot.send_message(
+                admin,
+                f"✅ **VERIFIED!**\n👤 @{username}\n📧 `{gmail}`\n💰 ₹15 (Hold 5 Days)"
+            )
+        except:
+            pass
+    
+    try:
+        await context.bot.send_message("escrow2929", f"✅ @{username}\n📧 `{gmail}`\n💰 ₹15")
+    except:
+        pass
+    
+    if not data["email_stock"]:
+        for admin in ADMINS:
+            try:
+                await context.bot.send_message(admin, "⚠️ STOCK EMPTY! Use /upload")
+            except:
+                pass
+    
+    await update.message.reply_text(
+        f"🎉 **VERIFIED!**\n✅ Gmail: `{gmail}`\n💰 ₹15 (5 Days Hold)\n👑 Admin: {ESCROW_USER}",
+        parse_mode='Markdown'
+    )
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global data
+    data = load_data()
+    user_id = str(update.effective_user.id)
+    if user_id in data["pending"]:
+        pending = data["pending"][user_id]
+        name = pending.get("name", pending.get("username", "User"))
+        data["email_stock"].append(f"{name}|{pending['gmail']}|{pending['password']}|{pending['recovery']}")
+        del data["pending"][user_id]
+        save_data(data)
+        await update.message.reply_text("❌ Cancelled! Gmail returned.", parse_mode='Markdown')
+    else:
+        await update.message.reply_text("❌ No active session.", parse_mode='Markdown')
+
+async def setupi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global data
+    data = load_data()
+    user_id = str(update.effective_user.id)
+    if len(context.args) < 1:
+        await update.message.reply_text("❌ Usage: /setupi [UPI_ID]", parse_mode='Markdown')
+        return
+    upi = context.args[0]
+    if user_id not in data["users"]:
+        data["users"][user_id] = {"gmail": "", "password": "", "recovery": "", "timestamp": "", "upi": upi, "balance": 0, "username": update.effective_user.first_name, "completed": False}
+    else:
+        data["users"][user_id]["upi"] = upi
+    save_data(data)
+    await update.message.reply_text(f"✅ UPI Set: `{upi}`", parse_mode='Markdown')
+
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global data
+    data = load_data()
+    user_id = str(update.effective_user.id)
+    if user_id not in data["users"]:
+        await update.message.reply_text("❌ No account!", parse_mode='Markdown')
+        return
+    user = data["users"][user_id]
+    await update.message.reply_text(f"💰 Balance: ₹{user.get('balance', 0)}", parse_mode='Markdown')
+
+async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global data
+    data = load_data()
+    user_id = str(update.effective_user.id)
+    if user_id not in data["users"]:
+        await update.message.reply_text("❌ No account!", parse_mode='Markdown')
+        return
+    user = data["users"][user_id]
+    balance = user.get("balance", 0)
+    upi = user.get("upi", "")
+    if not upi:
+        await update.message.reply_text("❌ Set UPI: /setupi [UPI]", parse_mode='Markdown')
+        return
+    if balance <= 0:
+        await update.message.reply_text(f"❌ Balance: ₹{balance}", parse_mode='Markdown')
+        return
+    if len(context.args) < 1:
+        await update.message.reply_text(f"💰 Balance: ₹{balance}\nUsage: /withdraw [amount]", parse_mode='Markdown')
+        return
+    try:
+        amount = int(context.args[0])
+    except:
+        await update.message.reply_text("❌ Invalid amount!", parse_mode='Markdown')
+        return
+    if amount > balance:
+        await update.message.reply_text(f"❌ Balance: ₹{balance}", parse_mode='Markdown')
+        return
+    if amount < 15:
+        await update.message.reply_text("❌ Minimum ₹15!", parse_mode='Markdown')
+        return
+    
+    withdraw_data = {"user_id": user_id, "username": update.effective_user.first_name, "upi": upi, "amount": amount, "timestamp": datetime.now().isoformat(), "status": "pending"}
+    if "withdraw_requests" not in data:
+        data["withdraw_requests"] = []
+    data["withdraw_requests"].append(withdraw_data)
+    save_data(data)
+    
+    for admin in ADMINS:
+        try:
+            await context.bot.send_message(
+                admin,
+                f"💰 **WITHDRAWAL!**\n👤 @{update.effective_user.username}\n📌 `{upi}`\n💰 ₹{amount}\n/approve {user_id} {amount}"
+            )
+        except:
+            pass
+    
+    await update.message.reply_text(f"✅ Request Sent!\n💰 ₹{amount}\n📌 Pending", parse_mode='Markdown')
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global data
+    data = load_data()
+    user_id = str(update.effective_user.id)
+    if user_id in data["pending"]:
+        pending = data["pending"][user_id]
+        start_time = datetime.fromisoformat(pending["timestamp"])
+        elapsed = (datetime.now() - start_time).seconds // 60
+        remaining = max(0, TASK_TIMEOUT_MINUTES - elapsed)
+        await update.message.reply_text(
+            f"⏳ **PENDING**\n📧 `{pending['gmail']}`\n⏰ Time Left: {remaining} min",
+            parse_mode='Markdown'
+        )
+    elif user_id in data["users"] and data["users"][user_id].get("completed", False):
+        user = data["users"][user_id]
+        await update.message.reply_text(f"✅ **VERIFIED**\n📧 `{user['gmail']}`\n💰 ₹{user.get('balance', 0)}", parse_mode='Markdown')
+    else:
+        await update.message.reply_text("❌ No active. Use /new", parse_mode='Markdown')
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    is_admin_user = is_admin(update.effective_user.id)
+    
+    help_text = (
+        "📧 **HELP**\n\n"
+        "**User Commands:**\n"
+        "/new - Start verification\n/status - Check status\n/balance - Check balance\n/withdraw - Withdraw\n/setupi [UPI] - Set UPI\n/cancel - Cancel\n/help - Help\n"
+    )
+    
+    if is_admin_user:
+        help_text += (
+            "\n**Admin Commands:**\n"
+            "/upload Name|Email|Pass|Rec - Add stock\n/stock - Check stock\n/approve [user_id] [amount] - Approve withdrawal\n/newadmin [user_id] - Add new admin (Owner only)\n"
+        )
+    
+    help_text += f"\n👑 Admin: {ESCROW_USER}"
+    
+    await update.message.reply_text(help_text, parse_mode='Markdown')
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Error: {context.error}")
 
 # ============ MAIN ============
 def main():
-    app = Application.builder().token(TOKEN).build()
+    global data, ADMINS
+    data = load_data()
+    ADMINS = data.get("admins", [OWNER_ID])
+    
+    # Timeout fix
+    request = HTTPXRequest(
+        connect_timeout=60.0,
+        read_timeout=60.0,
+        write_timeout=60.0,
+        pool_timeout=60.0,
+    )
+    
+    app = Application.builder().token(TOKEN).request(request).build()
+    
+    # User commands
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("new", new_command))
+    app.add_handler(CommandHandler("skip2fa", skip2fa_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("balance", balance_command))
+    app.add_handler(CommandHandler("withdraw", withdraw_command))
+    app.add_handler(CommandHandler("setupi", setupi_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("tiers", tiers))
-    app.add_handler(CommandHandler("buy", buy_command))
-    app.add_handler(CommandHandler("gen", gen_code))
-    app.add_handler(CommandHandler("redeem", redeem_code))
-    app.add_handler(CommandHandler("expiry", expiry_command))
-    app.add_handler(CallbackQueryHandler(button_callback))
+    
+    # Admin commands
+    app.add_handler(CommandHandler("upload", upload_command))
+    app.add_handler(CommandHandler("stock", stock_command))
+    app.add_handler(CommandHandler("approve", approve_command))
+    app.add_handler(CommandHandler("newadmin", newadmin_command))  # Owner only
+    
+    # Message handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_screenshot))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_screenshot))
     app.add_error_handler(error_handler)
     
-    if app.job_queue:
-        app.job_queue.run_repeating(self_ping, interval=600, first=10)
-        print("🔄 Self-ping scheduled (every 10 minutes)")
+    # Job Queue
+    job_queue = app.job_queue
+    if job_queue:
+        # Self ping har 5 minute (300 seconds)
+        job_queue.run_repeating(self_ping, interval=300, first=30)
+        # Timeout check har 1 minute
+        job_queue.run_repeating(check_timeout_job, interval=60, first=60)
+        print("🔄 Self ping scheduled (every 5 minutes)")
+        print("⏰ Timeout check scheduled (every minute)")
     
-    print("🚀 Bot started with Telegram Premium Emojis!")
+    print("🚀 Gmail 2FA Verification Bot started!")
     print(f"👑 Owner ID: {OWNER_ID}")
-    print(f"💎 Total Premium Emojis: {len(TELEGRAM_PREMIUM_EMOJIS)}")
+    print(f"👥 Admins: {ADMINS}")
+    print(f"📦 Stock: {len(data['email_stock'])}")
+    print(f"🔄 Maintenance: {MAINTENANCE_START}:00 - {MAINTENANCE_END}:00 IST")
+    
     app.run_polling()
 
 if __name__ == "__main__":
